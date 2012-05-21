@@ -1,0 +1,72 @@
+#!/bin/bash
+
+### Nagios plug-in to check how fast a disk is filling up.
+### Note that it needs at least two runs to calculate a rate,
+## an at least three runs to generate anything...
+
+## This part of the command is designed to run in a cron job every minute,
+## sheepishly storing a few minutes worth of available disk space in a
+## text file in /var/run.
+
+cat > /dev/null <<EOF
+
+Example output:
+--------------------------------------------------------------------------------
+Filesystem    Type 1024-blocks      Used Available Capacity Mounted on
+/dev/vda      ext4    10321208   5475944   4320988      56% /
+--------------------------------------------------------------------------------
+EOF
+
+# Store timestamp from time of df.
+statefile=/var/run/$(basename $0)-statefile
+offsetfile=/var/run/$(basename $0)-offset
+date=$(date +%s)
+df="$(
+  df -P -l -x none -x unknown -x iso9660 -x squashfs -x udf -x romfs -x ramfs -x debugfs -x simfs -x tmpfs -x devtmpfs
+)"
+
+# Start with an initial yaml header
+echo '---' >> $statefile
+
+while read fs k u avail c mountpoint
+do
+  ## Ignore the "header" line if it appears
+  [[ $avail =~ ^[0-9]*$ ]] || continue;
+  echo $date $fs $mountpoint $avail >> $statefile 
+done <<< "$df"
+
+# Calculate how far into the file the new offset should be.
+
+if [ -r $offsetfile ] ; then
+  offset=$(<$offsetfile)
+else
+  offset=0
+fi
+
+oldest=$(( $(date +%s) - 300 ))  # Cap it at 5 minutes.
+# Start at the current offset, and read until you see a date older than x minutes.
+while read timestamp line ; do
+  offset=$[offset+1]
+  echo offset=$offset  timestamp=$timestamp oldest=$oldest
+  # Lots of ways to _NOT_ break out of the loop:
+  [ -z "$timestamp" ] && continue;  # there's something fishy going on here, blank lines in our statefile.
+  [ "$timestamp" == "---" ] && continue; # separator.  just skip it.
+  [[ $timestamp =~ ^[0-9]*$ ]] || continue; # garbage in our statefile
+  [ $timestamp -lt $oldest ] && continue; # timestamp is too old (smaller than the oldest we accept)
+  echo We've found a timestamp that's newer.
+  offset=$[offset-1]
+  break;
+done <<< "$( tail -n +$offset $statefile )"
+
+echo $offset > $offsetfile
+
+
+
+# Store a file with all of the state.
+# $(date +%s) <device> <mountpoint> <avail>
+# 1892378234 /dev/sda1 /var/spool 38948290
+# 1892378234 /dev/sda2 / 234290
+# 1892378295 /dev/sda2 /var/spool 38989337
+# 1892378295 /dev/sda1 / 223290
+# The date is the date/time of the reading.
+

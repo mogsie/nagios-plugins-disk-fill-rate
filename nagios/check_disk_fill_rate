@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# TODO get these from options
+warning_seconds=$((3600 * 48))
+critical_seconds=$((3600 * 16))
+
+critical=0
+warning=0
+message="fill rate: "
+
+# Store the tail for multiple passes with the same data set (in case the files change under our feet)
+data="$(tail -n +$(</var/run/disk_fill_rate-offset) /var/run/disk_fill_rate-statefile | grep ^[0-9])"
+
+declare -a mountpoints
+declare -a timestamps
+declare -A availability
+while read timestamp device mountpoint available ; do
+  [[ "${mountpoints[@]} " =~ "${mountpoint} " ]] || mountpoints[${#mountpoints[*]}]=$mountpoint
+  [[ "${timestamps[@]}" =~ $timestamp ]] || timestamps[${#timestamps[*]}]=$timestamp
+  availability["$mountpoint:$timestamp"]=$available
+done <<< "$data"
+
+# I now have a list of mountpoints and a list of timestamps,
+# and a hash of how many kilobytes the disk had at what time.
+
+#echo mountpoints=${mountpoints[*]}
+#echo timestamps=${timestamps[@]}
+#echo "availability=${availability[*]}"
+
+for mountpoint in "${mountpoints[@]}"
+do
+  lowestbyterate=
+  #echo "Mountpoint $mountpoint"
+  oldtimestamp=${timestamps[0]}
+  for timestamp in "${timestamps[@]:1}"
+  do
+    delta_seconds=$(( timestamp - oldtimestamp))
+    # Avoid divide by zero bugs and other strangeness.
+    [[ $delta_seconds -lt 1 ]] && continue
+    delta_kilobytes=$(( ${availability["$mountpoint:$oldtimestamp"]} - ${availability["$mountpoint:$timestamp"]} ))
+    #echo $delta_seconds seconds eats $delta_kilobytes kilobytes
+    byterate=$((delta_kilobytes * 1024 / delta_seconds))
+    # Ignore anomalies where the amount of free disk space increased...
+    [ $byterate -lt 1 ] && {
+      lowestbyterate=1
+      break;
+    }
+    # echo "bytes/sec = $byterate"
+    lowestbyterate=${lowestbyterate:=$byterate}
+    [[ $byterate -lt $lowestbyterate ]] && lowestbyterate=$byterate
+    oldtimestamp=$timestamp
+  done
+  # echo Lowest byte rate = $lowestbyterate
+  # extrapolate from that.
+  if [ $lowestbyterate == 1 ] ; then
+    messages="${messages}${mountpoint} not filling up. "
+  else
+    bytestogo=$(( ${availability["$mountpoint:$timestamp"]} * 1024))
+    secondstogo=$(( bytestogo / lowestbyterate ))
+    if [ $secondstogo -lt $critical_seconds ] ; then
+      criticalmessages="${criticalmessages}${mountpoint} full within $((secondstogo/3600)) hours. "
+    elif [ $secondstogo -lt $warning_seconds ] ; then
+      warningmessages="${warningmessages}${mountpoint} good for only $((secondstogo/3600)) hours. "
+    else
+      if [ $((secondstogo/86400)) -gt 30 ] ; then
+        messages="${messages}${mountpoint} not filling up. "
+      else
+        messages="${messages}${mountpoint} good for $((secondstogo/86400)) days. "
+      fi
+    fi
+    # echo "$secondstogo seconds until disk fills up"
+  fi
+done
+
+echo "${criticalmessages}${warningmessages}${messages}"
+if [ ! -z "$criticalmessages" ] ; then
+  exit 2
+fi
+if [ ! -z "$warningmessages" ] ; then
+  exit 1
+fi
+if [ ! -z "$messages" ] ; then
+  exit 0
+fi
+# no messages, means no disks?
+exit 3
+
+
